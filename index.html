@@ -4,8 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VoiceRec</title>
+  <script>
+    try {
+      if (localStorage.getItem("voiceRecTheme") === "light") {
+        document.documentElement.setAttribute("data-theme", "light");
+      }
+    } catch (error) {}
+  </script>
   <style>
-    :root { color-scheme: light dark; }
+    :root {
+      color-scheme: dark;
+      --bg: #000000;
+      --fg: #f4f1ea;
+      --line: #444444;
+      --accent: #a8c7fa;
+      --on-accent: #062e6f;
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --fg: #1c1b19;
+      --line: #c9c4ba;
+      --accent: #0b57d0;
+      --on-accent: #ffffff;
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -13,8 +35,8 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      background: light-dark(#f4f1ea, #1c1b19);
-      color: light-dark(#1c1b19, #f4f1ea);
+      background: var(--bg);
+      color: var(--fg);
       font-family: system-ui, sans-serif;
     }
     main {
@@ -54,11 +76,11 @@
     .transport button { flex: 1 1 0; }
     #start {
       border: 0;
-      background: light-dark(#0b57d0, #a8c7fa);
-      color: light-dark(#fff, #062e6f);
+      background: var(--accent);
+      color: var(--on-accent);
     }
     .plain {
-      border: 1px solid light-dark(#c9c4ba, #4a463f);
+      border: 1px solid var(--line);
       background: transparent;
       color: inherit;
     }
@@ -67,9 +89,9 @@
       display: block;
       width: 100%;
       margin-top: 8px;
-      border: 1px solid light-dark(#0b57d0, #a8c7fa);
+      border: 1px solid var(--accent);
       background: transparent;
-      color: light-dark(#0b57d0, #a8c7fa);
+      color: var(--accent);
     }
     #status {
       min-height: 1.4em;
@@ -86,8 +108,8 @@
       min-height: 32px;
       padding: 0 10px;
       font-size: 12px;
-      border: 1px solid light-dark(#c9c4ba, #4a463f);
-      background: light-dark(#f4f1ea, #1c1b19);
+      border: 1px solid var(--line);
+      background: var(--bg);
       color: inherit;
     }
     #setting-panel {
@@ -97,16 +119,17 @@
       width: min(240px, calc(100% - 24px));
       margin: 0;
       padding: 12px;
-      border: 1px solid light-dark(#c9c4ba, #4a463f);
+      border: 1px solid var(--line);
       border-radius: 12px;
-      background: light-dark(#f4f1ea, #1c1b19);
+      background: var(--bg);
       color: inherit;
     }
     #setting-panel p {
-      margin: 0 0 8px;
+      margin: 12px 0 8px;
       font-size: 13px;
       line-height: 1.4;
     }
+    #setting-panel p:first-child { margin-top: 0; }
     #setting-panel label {
       display: flex;
       align-items: center;
@@ -129,6 +152,8 @@
     <p id="status" role="status"></p>
   </main>
   <div id="setting-panel" hidden>
+    <p id="theme-note">화면. 기본은 Dark입니다.</p>
+    <div id="theme-choices"></div>
     <p id="setting-note">형식과 음질은 다음 녹음부터 적용됩니다.</p>
     <div id="format-choices"></div>
     <p id="quality-note">음질. 기본은 Mid입니다.</p>
@@ -306,6 +331,15 @@
         var ctx = new AudioContext();
         audioCtx = ctx;
         var source = ctx.createMediaStreamSource(sourceStream);
+        var rumble = ctx.createBiquadFilter();
+        rumble.type = "highpass";
+        rumble.frequency.value = 80;
+        rumble.Q.value = 0.707;
+        var presence = ctx.createBiquadFilter();
+        presence.type = "peaking";
+        presence.frequency.value = 3000;
+        presence.Q.value = 1;
+        presence.gain.value = 6;
         var gain = ctx.createGain();
         gain.gain.value = 4;
         var compressor = ctx.createDynamicsCompressor();
@@ -317,7 +351,9 @@
         var dest = ctx.createMediaStreamDestination();
         dest.channelCount = 1;
         dest.channelCountMode = "explicit";
-        source.connect(gain);
+        source.connect(rumble);
+        rumble.connect(presence);
+        presence.connect(gain);
         gain.connect(compressor);
         compressor.connect(dest);
         return dest.stream;
@@ -895,9 +931,39 @@
       var settingNote = document.getElementById("setting-note");
       var formatChoices = document.getElementById("format-choices");
       var qualityChoices = document.getElementById("quality-choices");
+      var themeChoices = document.getElementById("theme-choices");
       var formatKeys = availableKeys();
       var chosenKey = preferredKey();
       var qualityKey = preferredQuality();
+
+      function preferredTheme() {
+        var saved = "";
+        try { saved = localStorage.getItem("voiceRecTheme") || ""; } catch (error) {}
+        return saved === "light" ? "light" : "dark";
+      }
+
+      function applyTheme(theme) {
+        if (theme === "light") document.documentElement.setAttribute("data-theme", "light");
+        else document.documentElement.removeAttribute("data-theme");
+      }
+
+      applyTheme(preferredTheme());
+      ["light", "dark"].forEach(function (key) {
+        var label = document.createElement("label");
+        var input = document.createElement("input");
+        input.type = "radio";
+        input.name = "theme";
+        input.value = key;
+        input.checked = key === preferredTheme();
+        input.addEventListener("change", function () {
+          if (!input.checked) return;
+          try { localStorage.setItem("voiceRecTheme", key); } catch (error) {}
+          applyTheme(key);
+        });
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(key === "dark" ? "Dark" : "Light"));
+        themeChoices.appendChild(label);
+      });
 
       if (formatKeys.length === 0) {
         settingNote.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
