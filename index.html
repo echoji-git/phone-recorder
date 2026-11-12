@@ -129,8 +129,10 @@
     <p id="status" role="status"></p>
   </main>
   <div id="setting-panel" hidden>
-    <p id="setting-note">저장 형식. 다음 녹음부터 적용됩니다.</p>
+    <p id="setting-note">형식과 음질은 다음 녹음부터 적용됩니다.</p>
     <div id="format-choices"></div>
+    <p id="quality-note">음질. 기본은 Mid입니다.</p>
+    <div id="quality-choices"></div>
   </div>
   <button type="button" id="setting" class="plain" aria-expanded="false" aria-controls="setting-panel">Setting</button>
   <script>
@@ -237,6 +239,24 @@
         paint();
       }
 
+      var QUALITY = {
+        high: { label: "High · 고음질, 고용량", bits: 256000 },
+        mid: { label: "Mid", bits: 128000 },
+        low: { label: "Low", bits: 64000 }
+      };
+
+      function preferredQuality() {
+        var saved = "";
+        try { saved = localStorage.getItem("voiceRecQuality") || ""; } catch (error) {}
+        if (saved === "high" || saved === "low" || saved === "mid") return saved;
+        return "mid";
+      }
+
+      function markAppliedLater() {
+        if (mime) statusEl.textContent = "다음 녹음부터 적용됩니다.";
+        else paint();
+      }
+
       function chooseMime() {
         var key = preferredKey();
         return key ? supportedMime(key) : "";
@@ -323,14 +343,36 @@
         stopTracks();
         chunks = [];
         try {
-          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: false,
+              sampleRate: { ideal: 48000 }
+            }
+          });
         } catch (error) {
           statusEl.textContent = "마이크 권한을 허용해야 녹음할 수 있습니다. 브라우저 설정에서 마이크를 허용하세요.";
           return;
         }
         try {
-          recorder = new MediaRecorder(stream, { mimeType: mime });
-          recorder.addEventListener("dataavailable", onData);
+          recorder = new MediaRecorder(stream, {
+            mimeType: mime,
+            audioBitsPerSecond: QUALITY[preferredQuality()].bits
+          });
+        } catch (error) {
+          try {
+            recorder = new MediaRecorder(stream, { mimeType: mime });
+          } catch (second) {
+            stopTracks();
+            recorder = null;
+            statusEl.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
+            return;
+          }
+        }
+        recorder.addEventListener("dataavailable", onData);
+        try {
           recorder.start(1000);
         } catch (error) {
           stopTracks();
@@ -378,17 +420,41 @@
         paint();
       });
 
+      function saveBlob() {
+        var blob = new Blob(chunks, { type: mime || "audio/webm" });
+        var name = fileBase(nextIndex) + extension();
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = url;
+        link.download = name;
+        link.click();
+        window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        return name;
+      }
+
+      function resetTake() {
+        state = "idle";
+        stamp = "";
+        nextIndex = 1;
+        chunks = [];
+        mime = "";
+        accumulated = 0;
+        segmentStart = 0;
+        window.clearInterval(timer);
+      }
+
       stopBtn.addEventListener("click", async function () {
         if (busy || (state !== "recording" && state !== "paused")) return;
         busy = true;
         paint();
         try {
           if (state === "recording") freezeClock();
-          state = "stopped";
           await releaseRecorder();
           stopTracks();
           await releaseWakeLock();
-          statusEl.textContent = "정지";
+          var name = chunks.length > 0 ? saveBlob() : "";
+          resetTake();
+          statusEl.textContent = name ? ("저장함 " + name) : "녹음이 없습니다. Start를 누르세요.";
         } finally {
           busy = false;
           paint();
@@ -409,14 +475,7 @@
             statusEl.textContent = "녹음이 없습니다. Start를 누르세요.";
             return;
           }
-          var blob = new Blob(chunks, { type: mime || "audio/webm" });
-          var name = fileBase(nextIndex) + extension();
-          var url = URL.createObjectURL(blob);
-          var link = document.createElement("a");
-          link.href = url;
-          link.download = name;
-          link.click();
-          window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          var name = saveBlob();
           nextIndex += 1;
           statusEl.textContent = "저장함 " + name;
         } finally {
@@ -433,8 +492,10 @@
       var settingPanel = document.getElementById("setting-panel");
       var settingNote = document.getElementById("setting-note");
       var formatChoices = document.getElementById("format-choices");
+      var qualityChoices = document.getElementById("quality-choices");
       var formatKeys = availableKeys();
       var chosenKey = preferredKey();
+      var qualityKey = preferredQuality();
 
       if (formatKeys.length === 0) {
         settingNote.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
@@ -449,8 +510,7 @@
           input.addEventListener("change", function () {
             if (!input.checked) return;
             try { localStorage.setItem("voiceRecFormat", key); } catch (error) {}
-            if (mime) statusEl.textContent = "다음 녹음부터 적용됩니다.";
-            else paint();
+            markAppliedLater();
           });
           label.appendChild(input);
           label.appendChild(document.createTextNode(FORMATS[key].label));
@@ -460,6 +520,23 @@
           settingNote.textContent = "이 브라우저는 M4A를 만들지 못합니다. WebM만 저장됩니다.";
         }
       }
+
+      ["high", "mid", "low"].forEach(function (key) {
+        var label = document.createElement("label");
+        var input = document.createElement("input");
+        input.type = "radio";
+        input.name = "quality";
+        input.value = key;
+        input.checked = key === qualityKey;
+        input.addEventListener("change", function () {
+          if (!input.checked) return;
+          try { localStorage.setItem("voiceRecQuality", key); } catch (error) {}
+          markAppliedLater();
+        });
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(QUALITY[key].label));
+        qualityChoices.appendChild(label);
+      });
 
       settingBtn.addEventListener("click", function () {
         var willOpen = settingPanel.hidden;
