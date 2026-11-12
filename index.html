@@ -144,6 +144,8 @@
       var chunks = [];
       var mime = "";
       var stream = null;
+      var micStream = null;
+      var audioCtx = null;
       var recorder = null;
       var accumulated = 0;
       var segmentStart = 0;
@@ -285,9 +287,40 @@
       }
 
       function stopTracks() {
-        if (!stream) return;
-        stream.getTracks().forEach(function (track) { track.stop(); });
-        stream = null;
+        if (stream) {
+          stream.getTracks().forEach(function (track) { track.stop(); });
+          stream = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach(function (track) { track.stop(); });
+          micStream = null;
+        }
+        if (audioCtx) {
+          var ctx = audioCtx;
+          audioCtx = null;
+          ctx.close().catch(function () {});
+        }
+      }
+
+      function louderStream(sourceStream) {
+        var ctx = new AudioContext();
+        audioCtx = ctx;
+        var source = ctx.createMediaStreamSource(sourceStream);
+        var gain = ctx.createGain();
+        gain.gain.value = 4;
+        var compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.value = -18;
+        compressor.knee.value = 12;
+        compressor.ratio.value = 3;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.25;
+        var dest = ctx.createMediaStreamDestination();
+        dest.channelCount = 1;
+        dest.channelCountMode = "explicit";
+        source.connect(gain);
+        gain.connect(compressor);
+        compressor.connect(dest);
+        return dest.stream;
       }
 
       function releaseRecorder() {
@@ -343,7 +376,7 @@
         stopTracks();
         chunks = [];
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
+          micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               channelCount: 1,
               echoCancellation: true,
@@ -355,6 +388,17 @@
         } catch (error) {
           statusEl.textContent = "마이크 권한을 허용해야 녹음할 수 있습니다. 브라우저 설정에서 마이크를 허용하세요.";
           return;
+        }
+        try {
+          stream = louderStream(micStream);
+          await audioCtx.resume();
+        } catch (error) {
+          if (audioCtx) {
+            audioCtx.close().catch(function () {});
+            audioCtx = null;
+          }
+          stream = micStream;
+          micStream = null;
         }
         try {
           recorder = new MediaRecorder(stream, {
