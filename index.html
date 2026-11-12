@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VoiceRec</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: light-dark(#f4f1ea, #1c1b19);
+      color: light-dark(#1c1b19, #f4f1ea);
+      font-family: system-ui, sans-serif;
+    }
+    main {
+      width: min(100%, 420px);
+      padding: 32px 20px calc(24px + env(safe-area-inset-bottom));
+    }
+    #time {
+      margin: 0;
+      text-align: center;
+      font-size: 64px;
+      font-weight: 500;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }
+    #next {
+      margin: 16px 0 0;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    .transport {
+      display: flex;
+      gap: 8px;
+      margin-top: 28px;
+    }
+    button {
+      font: inherit;
+      font-size: 15px;
+      font-weight: 500;
+      border-radius: 999px;
+      min-height: 48px;
+      padding: 0 12px;
+    }
+    .transport button { flex: 1 1 0; }
+    #start {
+      border: 0;
+      background: light-dark(#0b57d0, #a8c7fa);
+      color: light-dark(#fff, #062e6f);
+    }
+    .plain {
+      border: 1px solid light-dark(#c9c4ba, #4a463f);
+      background: transparent;
+      color: inherit;
+    }
+    button:disabled { opacity: 0.4; }
+    #download {
+      display: block;
+      width: 100%;
+      margin-top: 8px;
+      border: 1px solid light-dark(#0b57d0, #a8c7fa);
+      background: transparent;
+      color: light-dark(#0b57d0, #a8c7fa);
+    }
+    #status {
+      min-height: 1.4em;
+      margin: 16px 0 0;
+      text-align: center;
+      font-size: 14px;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p id="time">00:00</p>
+    <p id="next">VoiceRec_(시작시각)_1</p>
+    <div class="transport">
+      <button type="button" id="start">Start</button>
+      <button type="button" class="plain" id="pause" disabled>Pause</button>
+      <button type="button" class="plain" id="stop" disabled>Stop</button>
+    </div>
+    <button type="button" id="download">Download</button>
+    <p id="status" role="status"></p>
+  </main>
+  <script>
+    (function () {
+      var state = "idle";
+      var busy = false;
+      var stamp = "";
+      var nextIndex = 1;
+      var chunks = [];
+      var mime = "";
+      var stream = null;
+      var recorder = null;
+      var accumulated = 0;
+      var segmentStart = 0;
+      var timer = 0;
+      var wakeLock = null;
+      var pendingFlush = null;
+
+      var timeEl = document.getElementById("time");
+      var nextEl = document.getElementById("next");
+      var statusEl = document.getElementById("status");
+      var startBtn = document.getElementById("start");
+      var pauseBtn = document.getElementById("pause");
+      var stopBtn = document.getElementById("stop");
+      var downloadBtn = document.getElementById("download");
+
+      function pad(value) {
+        return value < 10 ? "0" + value : String(value);
+      }
+
+      function elapsedMs() {
+        if (state === "recording") return accumulated + (Date.now() - segmentStart);
+        return accumulated;
+      }
+
+      function formatTime(ms) {
+        var total = Math.floor(ms / 1000);
+        var minutes = Math.floor(total / 60);
+        var seconds = total % 60;
+        return pad(minutes) + ":" + pad(seconds);
+      }
+
+      function stampNow() {
+        var now = new Date();
+        return String(now.getFullYear()).slice(2) +
+          pad(now.getMonth() + 1) + pad(now.getDate()) + "_" +
+          pad(now.getHours()) + pad(now.getMinutes());
+      }
+
+      function fileBase(index) {
+        return "VoiceRec_(" + stamp + ")_" + String(index);
+      }
+
+      function extension() {
+        if (mime.indexOf("mp4") !== -1) return ".mp4";
+        return ".webm";
+      }
+
+      function paint() {
+        timeEl.textContent = formatTime(elapsedMs());
+        nextEl.textContent = stamp ? fileBase(nextIndex) : "VoiceRec_(시작시각)_1";
+        pauseBtn.disabled = state !== "recording" || busy;
+        stopBtn.disabled = (state !== "recording" && state !== "paused") || busy;
+        startBtn.disabled = busy;
+      }
+
+      function tick() {
+        paint();
+      }
+
+      function chooseMime() {
+        var types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+        if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+        for (var i = 0; i < types.length; i++) {
+          if (MediaRecorder.isTypeSupported(types[i])) return types[i];
+        }
+        return "";
+      }
+
+      function onData(event) {
+        if (event.data && event.data.size > 0) chunks.push(event.data);
+        if (pendingFlush) {
+          var done = pendingFlush;
+          pendingFlush = null;
+          done();
+        }
+      }
+
+      function flush() {
+        if (!recorder || recorder.state !== "recording") return Promise.resolve();
+        return new Promise(function (resolve) {
+          pendingFlush = resolve;
+          try {
+            recorder.requestData();
+          } catch (error) {
+            pendingFlush = null;
+            resolve();
+          }
+        });
+      }
+
+      function stopTracks() {
+        if (!stream) return;
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        stream = null;
+      }
+
+      function releaseRecorder() {
+        var current = recorder;
+        recorder = null;
+        if (!current || current.state === "inactive") return Promise.resolve();
+        return new Promise(function (resolve) {
+          current.addEventListener("stop", function () { resolve(); }, { once: true });
+          try { current.stop(); } catch (error) { resolve(); }
+        });
+      }
+
+      async function releaseWakeLock() {
+        if (!wakeLock) return;
+        try { await wakeLock.release(); } catch (error) {}
+        wakeLock = null;
+      }
+
+      async function keepScreenOn() {
+        if (!navigator.wakeLock) {
+          statusEl.textContent = "화면을 켜 두세요. 화면이 꺼지면 녹음이 멈출 수 있습니다.";
+          return;
+        }
+        try {
+          wakeLock = await navigator.wakeLock.request("screen");
+        } catch (error) {
+          statusEl.textContent = "화면을 켜 두세요. 화면이 꺼지면 녹음이 멈출 수 있습니다.";
+        }
+      }
+
+      function beginClock() {
+        segmentStart = Date.now();
+        window.clearInterval(timer);
+        timer = window.setInterval(tick, 250);
+      }
+
+      function freezeClock() {
+        accumulated += Date.now() - segmentStart;
+        window.clearInterval(timer);
+      }
+
+      async function beginNewTake() {
+        mime = chooseMime();
+        if (!mime) {
+          statusEl.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          statusEl.textContent = "이 브라우저는 마이크를 열 수 없습니다.";
+          return;
+        }
+        await releaseRecorder();
+        stopTracks();
+        chunks = [];
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (error) {
+          statusEl.textContent = "마이크 권한을 허용해야 녹음할 수 있습니다. 브라우저 설정에서 마이크를 허용하세요.";
+          return;
+        }
+        try {
+          recorder = new MediaRecorder(stream, { mimeType: mime });
+          recorder.addEventListener("dataavailable", onData);
+          recorder.start(1000);
+        } catch (error) {
+          stopTracks();
+          recorder = null;
+          statusEl.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
+          return;
+        }
+        stamp = stampNow();
+        nextIndex = 1;
+        accumulated = 0;
+        state = "recording";
+        statusEl.textContent = "녹음 중";
+        beginClock();
+        await keepScreenOn();
+      }
+
+      function resumeTake() {
+        if (!recorder || recorder.state !== "paused") return;
+        recorder.resume();
+        state = "recording";
+        statusEl.textContent = "녹음 중";
+        beginClock();
+        keepScreenOn();
+      }
+
+      startBtn.addEventListener("click", async function () {
+        if (busy || state === "recording") return;
+        busy = true;
+        paint();
+        try {
+          if (state === "paused") resumeTake();
+          else await beginNewTake();
+        } finally {
+          busy = false;
+          paint();
+        }
+      });
+
+      pauseBtn.addEventListener("click", function () {
+        if (busy || state !== "recording" || !recorder || recorder.state !== "recording") return;
+        recorder.pause();
+        state = "paused";
+        freezeClock();
+        statusEl.textContent = "일시정지";
+        paint();
+      });
+
+      stopBtn.addEventListener("click", async function () {
+        if (busy || (state !== "recording" && state !== "paused")) return;
+        busy = true;
+        paint();
+        try {
+          if (state === "recording") freezeClock();
+          state = "stopped";
+          await releaseRecorder();
+          stopTracks();
+          await releaseWakeLock();
+          statusEl.textContent = "정지";
+        } finally {
+          busy = false;
+          paint();
+        }
+      });
+
+      downloadBtn.addEventListener("click", async function () {
+        if (busy) return;
+        if (!stamp || elapsedMs() < 1000 && chunks.length === 0) {
+          statusEl.textContent = "녹음이 없습니다. Start를 누르세요.";
+          return;
+        }
+        busy = true;
+        paint();
+        try {
+          await flush();
+          if (chunks.length === 0) {
+            statusEl.textContent = "녹음이 없습니다. Start를 누르세요.";
+            return;
+          }
+          var blob = new Blob(chunks, { type: mime || "audio/webm" });
+          var name = fileBase(nextIndex) + extension();
+          var url = URL.createObjectURL(blob);
+          var link = document.createElement("a");
+          link.href = url;
+          link.download = name;
+          link.click();
+          window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          nextIndex += 1;
+          statusEl.textContent = "저장함 " + name;
+        } finally {
+          busy = false;
+          paint();
+        }
+      });
+
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible" && state === "recording") keepScreenOn();
+      });
+
+      paint();
+    })();
+  </script>
+</body>
+</html>
