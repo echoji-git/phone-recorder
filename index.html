@@ -187,7 +187,7 @@
       }
 
       var FORMATS = {
-        m4a: { label: "M4A", types: ["audio/mp4"], ext: ".m4a" },
+        m4a: { label: "M4A", types: ["audio/mp4;codecs=mp4a.40.2"], ext: ".m4a" },
         webm: { label: "WebM", types: ["audio/webm;codecs=opus", "audio/webm"], ext: ".webm" }
       };
 
@@ -403,7 +403,8 @@
         busy = true;
         paint();
         try {
-          if (state === "paused") resumeTake();
+          if (state === "paused" && recorder) resumeTake();
+          else if (state === "paused" && chunks.length > 0) statusEl.textContent = "휴대폰에서 재생되는 파일로 바꾸지 못했습니다. Download를 다시 누르세요.";
           else await beginNewTake();
         } finally {
           busy = false;
@@ -420,8 +421,346 @@
         paint();
       });
 
-      function saveBlob() {
-        var blob = new Blob(chunks, { type: mime || "audio/webm" });
+      function flattenAudioMp4(input) {
+        var u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
+        var view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+        function four(o) {
+          return String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+        }
+
+        function listBoxes(start, end) {
+          var out = [];
+          var o = start;
+          while (o + 8 <= end) {
+            var size = view.getUint32(o);
+            var header = 8;
+            if (size === 1) {
+              size = view.getUint32(o + 8) * 4294967296 + view.getUint32(o + 12);
+              header = 16;
+            } else if (size === 0) {
+              size = end - o;
+            }
+            if (size < header || o + size > end) break;
+            out.push({ type: four(o + 4), start: o, header: header, end: o + size });
+            o += size;
+          }
+          return out;
+        }
+
+        function findBox(root, type) {
+          var kids = listBoxes(root.start + root.header, root.end);
+          for (var i = 0; i < kids.length; i++) {
+            if (kids[i].type === type) return kids[i];
+            if (kids[i].type === "moov" || kids[i].type === "trak" || kids[i].type === "mdia" || kids[i].type === "minf" || kids[i].type === "stbl" || kids[i].type === "mvex" || kids[i].type === "moof" || kids[i].type === "traf" || kids[i].type === "dinf") {
+              var hit = findBox(kids[i], type);
+              if (hit) return hit;
+            }
+          }
+          return null;
+        }
+
+        var top = listBoxes(0, u8.length);
+        var moov = null;
+        for (var t = 0; t < top.length; t++) if (top[t].type === "moov") moov = top[t];
+        if (!moov) throw new Error("no moov");
+        var stsd = findBox(moov, "stsd");
+        var mdhd = findBox(moov, "mdhd");
+        var hdlr = findBox(moov, "hdlr");
+        if (!stsd || !mdhd || !hdlr) throw new Error("incomplete moov");
+        var entry = four(stsd.start + 20);
+        if (entry !== "mp4a") throw new Error("not aac");
+
+        var mdhdVer = u8[mdhd.start + 8];
+        var timescale = mdhdVer === 1 ? view.getUint32(mdhd.start + 28) : view.getUint32(mdhd.start + 20);
+        if (!timescale) throw new Error("no timescale");
+
+        var trex = findBox(moov, "trex");
+        var defDur = 0;
+        var defSize = 0;
+        var defFlags = 0;
+        if (trex) {
+          defDur = view.getUint32(trex.start + 20);
+          defSize = view.getUint32(trex.start + 24);
+          defFlags = view.getUint32(trex.start + 28);
+        }
+
+        var samples = [];
+        var pieces = [];
+        for (var i = 0; i < top.length; i++) {
+          if (top[i].type !== "moof") continue;
+          var moof = top[i];
+          var kids = listBoxes(moof.start + moof.header, moof.end);
+          for (var k = 0; k < kids.length; k++) {
+            if (kids[k].type !== "traf") continue;
+            var trafKids = listBoxes(kids[k].start + kids[k].header, kids[k].end);
+            var tfhd = null;
+            var truns = [];
+            for (var c = 0; c < trafKids.length; c++) {
+              if (trafKids[c].type === "tfhd") tfhd = trafKids[c];
+              if (trafKids[c].type === "trun") truns.push(trafKids[c]);
+            }
+            if (!tfhd || truns.length === 0) throw new Error("bad traf");
+            var tfFlags = view.getUint32(tfhd.start + 8) & 0xffffff;
+            var p = tfhd.start + 16;
+            var base = 0;
+            if (tfFlags & 0x1) {
+              base = view.getUint32(p) * 4294967296 + view.getUint32(p + 4);
+              p += 8;
+            } else if (tfFlags & 0x20000) {
+              base = moof.start;
+            }
+            var dur = defDur;
+            var size = defSize;
+            if (tfFlags & 0x2) p += 4;
+            if (tfFlags & 0x8) { dur = view.getUint32(p); p += 4; }
+            if (tfFlags & 0x10) { size = view.getUint32(p); p += 4; }
+            if (tfFlags & 0x20) p += 4;
+            for (var r = 0; r < truns.length; r++) {
+              var trun = truns[r];
+              var vf = view.getUint32(trun.start + 8);
+              var version = vf >>> 24;
+              var f = vf & 0xffffff;
+              var q = trun.start + 12;
+              var count = view.getUint32(q);
+              q += 4;
+              var dataOff = 0;
+              if (f & 0x1) { dataOff = view.getInt32(q); q += 4; }
+              if (f & 0x4) q += 4;
+              var pos = base + dataOff;
+              for (var s = 0; s < count; s++) {
+                var sampleDur = dur;
+                var sampleSize = size;
+                if (f & 0x100) { sampleDur = view.getUint32(q); q += 4; }
+                if (f & 0x200) { sampleSize = view.getUint32(q); q += 4; }
+                if (f & 0x400) q += 4;
+                if (f & 0x800) q += 4;
+                if (sampleSize <= 0 || pos < 0 || pos + sampleSize > u8.length) throw new Error("bad sample");
+                samples.push(sampleDur);
+                pieces.push(u8.subarray(pos, pos + sampleSize));
+                pos += sampleSize;
+              }
+            }
+          }
+        }
+        if (samples.length === 0) throw new Error("no samples");
+
+        var payloadLen = 0;
+        for (var n = 0; n < pieces.length; n++) payloadLen += pieces[n].length;
+        var payload = new Uint8Array(payloadLen);
+        var cursor = 0;
+        for (var a = 0; a < pieces.length; a++) {
+          payload.set(pieces[a], cursor);
+          cursor += pieces[a].length;
+        }
+
+        var duration = 0;
+        for (var d = 0; d < samples.length; d++) duration += samples[d];
+        if (duration <= 0 || duration > 0xffffffff) throw new Error("bad duration");
+
+        var runs = [];
+        for (var e = 0; e < samples.length; e++) {
+          var last = runs[runs.length - 1];
+          if (last && last.dur === samples[e]) last.count += 1;
+          else runs.push({ dur: samples[e], count: 1 });
+        }
+
+        function Writer() { this.parts = []; this.len = 0; }
+        Writer.prototype.u16 = function (n) {
+          var b = new Uint8Array(2);
+          new DataView(b.buffer).setUint16(0, n);
+          this.parts.push(b);
+          this.len += 2;
+        };
+        Writer.prototype.u32 = function (n) {
+          var b = new Uint8Array(4);
+          new DataView(b.buffer).setUint32(0, n >>> 0);
+          this.parts.push(b);
+          this.len += 4;
+        };
+        Writer.prototype.fourcc = function (s) {
+          this.parts.push(new Uint8Array([s.charCodeAt(0), s.charCodeAt(1), s.charCodeAt(2), s.charCodeAt(3)]));
+          this.len += 4;
+        };
+        Writer.prototype.bytes = function (arr) { this.parts.push(arr); this.len += arr.length; };
+        Writer.prototype.zeros = function (n) { this.parts.push(new Uint8Array(n)); this.len += n; };
+        Writer.prototype.done = function () {
+          var out = new Uint8Array(this.len);
+          var at = 0;
+          for (var i = 0; i < this.parts.length; i++) {
+            out.set(this.parts[i], at);
+            at += this.parts[i].length;
+          }
+          return out;
+        };
+
+        function box(type, body) {
+          var w = new Writer();
+          w.u32(8 + body.len);
+          w.fourcc(type);
+          w.bytes(body.done());
+          return w.done();
+        }
+
+        var mvhd = new Writer();
+        mvhd.u32(0);
+        mvhd.u32(0);
+        mvhd.u32(0);
+        mvhd.u32(timescale);
+        mvhd.u32(duration);
+        mvhd.u32(0x00010000);
+        mvhd.u16(0x0100);
+        mvhd.u16(0);
+        mvhd.zeros(8);
+        mvhd.u32(0x00010000); mvhd.u32(0); mvhd.u32(0);
+        mvhd.u32(0); mvhd.u32(0x00010000); mvhd.u32(0);
+        mvhd.u32(0); mvhd.u32(0); mvhd.u32(0x40000000);
+        mvhd.zeros(24);
+        mvhd.u32(2);
+        var mvhdBox = box("mvhd", mvhd);
+
+        var tkhd = new Writer();
+        tkhd.u32(0x7);
+        tkhd.u32(0);
+        tkhd.u32(0);
+        tkhd.u32(1);
+        tkhd.u32(0);
+        tkhd.u32(duration);
+        tkhd.zeros(8);
+        tkhd.u16(0);
+        tkhd.u16(0);
+        tkhd.u16(0x0100);
+        tkhd.u16(0);
+        tkhd.u32(0x00010000); tkhd.u32(0); tkhd.u32(0);
+        tkhd.u32(0); tkhd.u32(0x00010000); tkhd.u32(0);
+        tkhd.u32(0); tkhd.u32(0); tkhd.u32(0x40000000);
+        tkhd.u32(0);
+        tkhd.u32(0);
+        var tkhdBox = box("tkhd", tkhd);
+
+        var mdhdBody = new Writer();
+        mdhdBody.u32(0);
+        mdhdBody.u32(0);
+        mdhdBody.u32(0);
+        mdhdBody.u32(timescale);
+        mdhdBody.u32(duration);
+        mdhdBody.u16(0x55c4);
+        mdhdBody.u16(0);
+        var mdhdBox = box("mdhd", mdhdBody);
+
+        var smhd = new Writer();
+        smhd.u32(0);
+        smhd.u16(0);
+        smhd.u16(0);
+        var smhdBox = box("smhd", smhd);
+
+        var url = new Writer();
+        url.u32(0x1);
+        var urlBox = box("url ", url);
+        var dref = new Writer();
+        dref.u32(0);
+        dref.u32(1);
+        dref.bytes(urlBox);
+        var drefBox = box("dref", dref);
+        var dinf = new Writer();
+        dinf.bytes(drefBox);
+        var dinfBox = box("dinf", dinf);
+
+        var stsdBytes = u8.subarray(stsd.start, stsd.end);
+        var stts = new Writer();
+        stts.u32(0);
+        stts.u32(runs.length);
+        for (var ri = 0; ri < runs.length; ri++) {
+          stts.u32(runs[ri].count);
+          stts.u32(runs[ri].dur);
+        }
+        var sttsBox = box("stts", stts);
+
+        var stsc = new Writer();
+        stsc.u32(0);
+        stsc.u32(1);
+        stsc.u32(1);
+        stsc.u32(samples.length);
+        stsc.u32(1);
+        var stscBox = box("stsc", stsc);
+
+        var same = pieces[0].length;
+        var uniform = true;
+        for (var si = 1; si < pieces.length; si++) {
+          if (pieces[si].length !== same) { uniform = false; break; }
+        }
+        var stsz = new Writer();
+        stsz.u32(0);
+        stsz.u32(uniform ? same : 0);
+        stsz.u32(samples.length);
+        if (!uniform) {
+          for (var zi = 0; zi < pieces.length; zi++) stsz.u32(pieces[zi].length);
+        }
+        var stszBox = box("stsz", stsz);
+
+        var ftyp = new Uint8Array([
+          0, 0, 0, 28, 0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20,
+          0, 0, 0, 0, 0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, 0x69, 0x73, 0x6f, 0x6d
+        ]);
+        var hdlrBytes = u8.subarray(hdlr.start, hdlr.end);
+        var stblLen = 8 + stsdBytes.length + sttsBox.length + stscBox.length + stszBox.length + 20;
+        var minfLen = 8 + smhdBox.length + dinfBox.length + stblLen;
+        var mdiaLen = 8 + mdhdBox.length + hdlrBytes.length + minfLen;
+        var trakLen = 8 + tkhdBox.length + mdiaLen;
+        var moovLen = 8 + mvhdBox.length + trakLen;
+        var chunkOffset = ftyp.length + moovLen + 8;
+
+        var stco = new Writer();
+        stco.u32(0);
+        stco.u32(1);
+        stco.u32(chunkOffset);
+        var stcoBox = box("stco", stco);
+
+        var stbl = new Writer();
+        stbl.bytes(stsdBytes);
+        stbl.bytes(sttsBox);
+        stbl.bytes(stscBox);
+        stbl.bytes(stszBox);
+        stbl.bytes(stcoBox);
+        var stblBox = box("stbl", stbl);
+        var minfBody = new Writer();
+        minfBody.bytes(smhdBox);
+        minfBody.bytes(dinfBox);
+        minfBody.bytes(stblBox);
+        var minfBox = box("minf", minfBody);
+        var mdiaBody = new Writer();
+        mdiaBody.bytes(mdhdBox);
+        mdiaBody.bytes(hdlrBytes);
+        mdiaBody.bytes(minfBox);
+        var mdiaBox = box("mdia", mdiaBody);
+        var trakBody = new Writer();
+        trakBody.bytes(tkhdBox);
+        trakBody.bytes(mdiaBox);
+        var trakBox = box("trak", trakBody);
+        var moovBody = new Writer();
+        moovBody.bytes(mvhdBox);
+        moovBody.bytes(trakBox);
+        var moovBox = box("moov", moovBody);
+
+        var mdat = new Writer();
+        mdat.u32(8 + payload.length);
+        mdat.fourcc("mdat");
+        mdat.bytes(payload);
+        var file = new Writer();
+        file.bytes(ftyp);
+        file.bytes(moovBox);
+        file.bytes(mdat.done());
+        return file.done();
+      }
+
+
+      async function saveBlob() {
+        var type = mime || "audio/webm";
+        var blob = new Blob(chunks, { type: type });
+        if (type.indexOf("mp4") !== -1) {
+          var bytes = new Uint8Array(await blob.arrayBuffer());
+          blob = new Blob([flattenAudioMp4(bytes)], { type: "audio/mp4" });
+        }
         var name = fileBase(nextIndex) + extension();
         var url = URL.createObjectURL(blob);
         var link = document.createElement("a");
@@ -452,9 +791,21 @@
           await releaseRecorder();
           stopTracks();
           await releaseWakeLock();
-          var name = chunks.length > 0 ? saveBlob() : "";
+          if (chunks.length === 0) {
+            resetTake();
+            statusEl.textContent = "녹음이 없습니다. Start를 누르세요.";
+            return;
+          }
+          var name = "";
+          try {
+            name = await saveBlob();
+          } catch (error) {
+            state = "paused";
+            statusEl.textContent = "휴대폰에서 재생되는 파일로 바꾸지 못했습니다. Download를 다시 누르세요.";
+            return;
+          }
           resetTake();
-          statusEl.textContent = name ? ("저장함 " + name) : "녹음이 없습니다. Start를 누르세요.";
+          statusEl.textContent = "저장함 " + name;
         } finally {
           busy = false;
           paint();
@@ -475,8 +826,15 @@
             statusEl.textContent = "녹음이 없습니다. Start를 누르세요.";
             return;
           }
-          var name = saveBlob();
-          nextIndex += 1;
+          var name = "";
+          try {
+            name = await saveBlob();
+          } catch (error) {
+            statusEl.textContent = "휴대폰에서 재생되는 파일로 바꾸지 못했습니다. Download를 다시 누르세요.";
+            return;
+          }
+          if (!recorder) resetTake();
+          else nextIndex += 1;
           statusEl.textContent = "저장함 " + name;
         } finally {
           busy = false;
