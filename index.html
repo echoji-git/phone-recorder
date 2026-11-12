@@ -19,7 +19,7 @@
     }
     main {
       width: min(100%, 420px);
-      padding: 32px 20px calc(24px + env(safe-area-inset-bottom));
+      padding: 32px 20px calc(64px + env(safe-area-inset-bottom));
     }
     #time {
       margin: 0;
@@ -79,6 +79,41 @@
       line-height: 1.4;
       word-break: break-all;
     }
+    #setting {
+      position: fixed;
+      left: 12px;
+      bottom: calc(12px + env(safe-area-inset-bottom));
+      min-height: 32px;
+      padding: 0 10px;
+      font-size: 12px;
+      border: 1px solid light-dark(#c9c4ba, #4a463f);
+      background: light-dark(#f4f1ea, #1c1b19);
+      color: inherit;
+    }
+    #setting-panel {
+      position: fixed;
+      left: 12px;
+      bottom: calc(52px + env(safe-area-inset-bottom));
+      width: min(240px, calc(100% - 24px));
+      margin: 0;
+      padding: 12px;
+      border: 1px solid light-dark(#c9c4ba, #4a463f);
+      border-radius: 12px;
+      background: light-dark(#f4f1ea, #1c1b19);
+      color: inherit;
+    }
+    #setting-panel p {
+      margin: 0 0 8px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    #setting-panel label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
@@ -93,6 +128,11 @@
     <button type="button" id="download">Download</button>
     <p id="status" role="status"></p>
   </main>
+  <div id="setting-panel" hidden>
+    <p id="setting-note">저장 형식. 다음 녹음부터 적용됩니다.</p>
+    <div id="format-choices"></div>
+  </div>
+  <button type="button" id="setting" class="plain" aria-expanded="false" aria-controls="setting-panel">Setting</button>
   <script>
     (function () {
       var state = "idle";
@@ -144,14 +184,50 @@
         return "VoiceRec_(" + stamp + ")_" + String(index);
       }
 
+      var FORMATS = {
+        m4a: { label: "M4A", types: ["audio/mp4"], ext: ".m4a" },
+        webm: { label: "WebM", types: ["audio/webm;codecs=opus", "audio/webm"], ext: ".webm" }
+      };
+
+      function supportedMime(key) {
+        var types = FORMATS[key].types;
+        if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+        for (var i = 0; i < types.length; i++) {
+          if (MediaRecorder.isTypeSupported(types[i])) return types[i];
+        }
+        return "";
+      }
+
+      function availableKeys() {
+        return ["m4a", "webm"].filter(function (key) { return supportedMime(key); });
+      }
+
+      function preferredKey() {
+        var saved = "";
+        try { saved = localStorage.getItem("voiceRecFormat") || ""; } catch (error) {}
+        var available = availableKeys();
+        if (saved && available.indexOf(saved) !== -1) return saved;
+        if (available.indexOf("m4a") !== -1) return "m4a";
+        return available[0] || "";
+      }
+
+      function activeType() {
+        if (mime) return mime;
+        var key = preferredKey();
+        return key ? supportedMime(key) : "";
+      }
+
       function extension() {
-        if (mime.indexOf("mp4") !== -1) return ".mp4";
-        return ".webm";
+        var type = activeType();
+        if (type.indexOf("mp4") !== -1) return ".m4a";
+        if (type.indexOf("webm") !== -1) return ".webm";
+        return "";
       }
 
       function paint() {
         timeEl.textContent = formatTime(elapsedMs());
-        nextEl.textContent = stamp ? fileBase(nextIndex) : "VoiceRec_(시작시각)_1";
+        var base = stamp ? fileBase(nextIndex) : "VoiceRec_(시작시각)_1";
+        nextEl.textContent = base + extension();
         pauseBtn.disabled = state !== "recording" || busy;
         stopBtn.disabled = (state !== "recording" && state !== "paused") || busy;
         startBtn.disabled = busy;
@@ -162,12 +238,8 @@
       }
 
       function chooseMime() {
-        var types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
-        if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
-        for (var i = 0; i < types.length; i++) {
-          if (MediaRecorder.isTypeSupported(types[i])) return types[i];
-        }
-        return "";
+        var key = preferredKey();
+        return key ? supportedMime(key) : "";
       }
 
       function onData(event) {
@@ -355,6 +427,44 @@
 
       document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible" && state === "recording") keepScreenOn();
+      });
+
+      var settingBtn = document.getElementById("setting");
+      var settingPanel = document.getElementById("setting-panel");
+      var settingNote = document.getElementById("setting-note");
+      var formatChoices = document.getElementById("format-choices");
+      var formatKeys = availableKeys();
+      var chosenKey = preferredKey();
+
+      if (formatKeys.length === 0) {
+        settingNote.textContent = "이 브라우저는 녹음 형식을 지원하지 않습니다.";
+      } else {
+        formatKeys.forEach(function (key) {
+          var label = document.createElement("label");
+          var input = document.createElement("input");
+          input.type = "radio";
+          input.name = "format";
+          input.value = key;
+          input.checked = key === chosenKey;
+          input.addEventListener("change", function () {
+            if (!input.checked) return;
+            try { localStorage.setItem("voiceRecFormat", key); } catch (error) {}
+            if (mime) statusEl.textContent = "다음 녹음부터 적용됩니다.";
+            else paint();
+          });
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(FORMATS[key].label));
+          formatChoices.appendChild(label);
+        });
+        if (formatKeys.indexOf("m4a") === -1) {
+          settingNote.textContent = "이 브라우저는 M4A를 만들지 못합니다. WebM만 저장됩니다.";
+        }
+      }
+
+      settingBtn.addEventListener("click", function () {
+        var willOpen = settingPanel.hidden;
+        settingPanel.hidden = !willOpen;
+        settingBtn.setAttribute("aria-expanded", willOpen ? "true" : "false");
       });
 
       paint();
